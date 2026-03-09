@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { useNostrConnect } from './useNostrConnect';
 import { QRCodeSVG } from 'qrcode.react';
 import { LightningAddress } from '@getalby/lightning-tools';
 import { nwc } from '@getalby/sdk';
@@ -80,23 +81,6 @@ async function fetchProfileByHexPubkey(hexPubkey) {
   return { ...profile, readonly: false };
 }
 
-// ── NIP-46 session generator (used from CardForm) ─────────────────────────────
-
-async function createNip46Session() {
-  const { generateSecretKey, getPublicKey, bytesToHex } = await import('nostr-tools/pure');
-  const { createNostrConnectURI } = await import('nostr-tools/nip46');
-  const localSecret = generateSecretKey();
-  const clientPubkey = getPublicKey(localSecret);
-  const randomSecret = bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
-  const uri = createNostrConnectURI({
-    clientPubkey,
-    relays: ['wss://relay.primal.net'],
-    secret: randomSecret,
-    name: 'Digital Card',
-    url: window.location.origin,
-  });
-  return { localSecret, clientPubkey, randomSecret, uri };
-}
 
 // ── Bitcoin price ticker ───────────────────────────────────────────────────────
 
@@ -489,13 +473,15 @@ function CardForm({ onDone, onBack, initialData }) {
   const [nostrImporting, setNostrImporting] = useState(false);
   const [nostrImportError, setNostrImportError] = useState('');
   const [nostrModal, setNostrModal] = useState(false);
-  // NIP-46 state (polling, survives app switching)
-  const [nip46Uri, setNip46Uri] = useState(null);
-  const [nip46Status, setNip46Status] = useState(null); // null | 'waiting' | 'connected'
-  const nip46Ref = useRef(null); // { localSecret, clientPubkey, randomSecret }
+  const nip46 = useNostrConnect();
 
-  // Cleanup on unmount
-  useEffect(() => () => stopNip46(), []);
+  useEffect(() => {
+    if (nip46.connected && nip46.remotePubkey) {
+      fetchProfileByHexPubkey(nip46.remotePubkey)
+        .then(profile => { applyNostrProfile(profile); setNostrModal(false); nip46.reset(); })
+        .catch(err => { setNostrImportError(err.message); nip46.reset(); });
+    }
+  }, [nip46.connected, nip46.remotePubkey]); // eslint-disable-line
 
   const [form, setForm] = useState({
     name: initialData?.name || '',
@@ -540,132 +526,6 @@ function CardForm({ onDone, onBack, initialData }) {
       setNostrImporting(false);
     }
   }
-
-  // NIP-46 polling refs
-  const pollIntervalRef = useRef(null);
-  const pendingGpkIdRef = useRef(null);
-  const nip46ConnectedRef = useRef(false);
-  const listenStartedRef = useRef(0);
-  const POLL_MS = 2000;
-  const NIP46_RELAYS = ['wss://relay.primal.net', 'wss://nos.lol'];
-
-  function stopNip46() {
-    clearInterval(pollIntervalRef.current);
-    pollIntervalRef.current = null;
-    nip46ConnectedRef.current = false;
-    pendingGpkIdRef.current = null;
-    nip46Ref.current = null;
-    setNip46Uri(null);
-    setNip46Status(null);
-  }
-
-  async function startNip46() {
-    stopNip46();
-    setNip46Status('waiting');
-    setNostrImportError('');
-    try {
-      const session = await createNip46Session();
-      nip46Ref.current = session;
-      nip46ConnectedRef.current = false;
-      listenStartedRef.current = Math.floor(Date.now() / 1000);
-      setNip46Uri(session.uri);
-      pollNip46Once();
-      pollIntervalRef.current = setInterval(pollNip46Once, POLL_MS);
-    } catch (err) {
-      setNip46Status(null);
-      setNostrImportError(err.message);
-    }
-  }
-
-  async function pollNip46Once() {
-    if (nip46ConnectedRef.current || !nip46Ref.current) return;
-    const { localSecret, clientPubkey } = nip46Ref.current;
-    const { SimplePool } = await import('nostr-tools');
-    const pool = new SimplePool();
-    try {
-      const events = await pool.querySync(NIP46_RELAYS, {
-        kinds: [24133], '#p': [clientPubkey],
-        since: listenStartedRef.current - 5,
-      });
-      for (const event of events) {
-        if (nip46ConnectedRef.current) break;
-        await processNip46Event(event, pool);
-      }
-    } catch { /* ignore */ } finally {
-      pool.close(NIP46_RELAYS);
-    }
-  }
-
-  async function processNip46Event(event, pool) {
-    if (!nip46Ref.current || nip46ConnectedRef.current) return;
-    const { localSecret, randomSecret } = nip46Ref.current;
-    const { nip44 } = await import('nostr-tools');
-    const { finalizeEvent } = await import('nostr-tools/pure');
-    const signerPubkey = event.pubkey;
-
-    let parsed;
-    try {
-      const convoKey = nip44.v2.utils.getConversationKey(localSecret, signerPubkey);
-      parsed = JSON.parse(nip44.v2.decrypt(event.content, convoKey));
-    } catch { return; }
-
-    const convoKey = nip44.v2.utils.getConversationKey(localSecret, signerPubkey);
-    const publish = async (payload) => {
-      const ev = finalizeEvent({
-        kind: 24133, created_at: Math.floor(Date.now() / 1000),
-        tags: [['p', signerPubkey]],
-        content: nip44.v2.encrypt(JSON.stringify(payload), convoKey),
-      }, localSecret);
-      await Promise.allSettled(pool.publish(NIP46_RELAYS, ev));
-    };
-
-    const hexId = () => Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
-
-    // Format A: signer sends { method: "connect" }
-    if (parsed.method === 'connect') {
-      await publish({ id: parsed.id, result: randomSecret, error: null });
-      const gpkId = hexId();
-      pendingGpkIdRef.current = gpkId;
-      await publish({ id: gpkId, method: 'get_public_key', params: [] });
-      return;
-    }
-
-    // Format B (Primal): signer sends { result: secret }
-    if (parsed.result === randomSecret && !pendingGpkIdRef.current) {
-      const gpkId = hexId();
-      pendingGpkIdRef.current = gpkId;
-      await publish({ id: gpkId, method: 'get_public_key', params: [] });
-      return;
-    }
-
-    // get_public_key response
-    if (pendingGpkIdRef.current &&
-        parsed.id === pendingGpkIdRef.current &&
-        typeof parsed.result === 'string' &&
-        /^[0-9a-f]{64}$/i.test(parsed.result)) {
-      nip46ConnectedRef.current = true;
-      clearInterval(pollIntervalRef.current);
-      setNip46Status('connected');
-      fetchProfileByHexPubkey(parsed.result)
-        .then(profile => { applyNostrProfile(profile); setNostrModal(false); stopNip46(); })
-        .catch(err => setNostrImportError(err.message));
-    }
-  }
-
-  // Poll immediately when page becomes visible (user returns from signer app)
-  useEffect(() => {
-    const handle = () => {
-      if (document.visibilityState === 'visible' && nip46Ref.current && !nip46ConnectedRef.current) {
-        pollNip46Once();
-      }
-    };
-    document.addEventListener('visibilitychange', handle);
-    window.addEventListener('focus', handle);
-    return () => {
-      document.removeEventListener('visibilitychange', handle);
-      window.removeEventListener('focus', handle);
-    };
-  }, []);
 
   function handleAvatarChange(e) {
     const file = e.target.files[0];
@@ -800,7 +660,7 @@ function CardForm({ onDone, onBack, initialData }) {
               {/* Nostr import */}
               <div style={{ marginBottom: '24px' }}>
                 <button
-                  onClick={() => { setNostrModal(true); setNostrImportError(''); setKeyInputError(''); }}
+                  onClick={() => { setNostrModal(true); setNostrImportError(''); }}
                   disabled={nostrImporting}
                   style={{
                     width: '100%', padding: '13px 16px',
@@ -884,9 +744,9 @@ function CardForm({ onDone, onBack, initialData }) {
                     </button>
 
                     {/* Opción 2: NIP-46 mobile (Primal + Amber) */}
-                    {!nip46Uri ? (
+                    {!nip46.uri ? (
                       <button
-                        onClick={startNip46}
+                        onClick={nip46.generateConnectionUri}
                         style={{
                           width: '100%', padding: '14px 16px', marginBottom: '4px',
                           background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
@@ -909,7 +769,7 @@ function CardForm({ onDone, onBack, initialData }) {
                         background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
                         borderRadius: '14px',
                       }}>
-                        {nip46Status === 'connected' ? (
+                        {nip46.connected ? (
                           <div style={{ textAlign: 'center', padding: '8px', color: '#4ade80', fontWeight: '600' }}>
                             ✅ Conectado — importando perfil...
                           </div>
@@ -917,14 +777,14 @@ function CardForm({ onDone, onBack, initialData }) {
                           <>
                             {/* QR code */}
                             <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px', background: '#fff', borderRadius: '12px', padding: '12px' }}>
-                              <QRCodeSVG value={nip46Uri} size={180} level="M" />
+                              <QRCodeSVG value={nip46.uri} size={180} level="M" />
                             </div>
                             <p style={{ margin: '0 0 10px', fontSize: '0.75rem', color: 'rgba(167,139,250,0.7)', textAlign: 'center' }}>
                               Escaneá con Primal, Amber u otra app Nostr
                             </p>
                             {/* Direct open buttons */}
                             <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
-                              <a href={nip46Uri} style={{ flex: 1, textDecoration: 'none' }}>
+                              <a href={nip46.uri} style={{ flex: 1, textDecoration: 'none' }}>
                                 <button style={{
                                   width: '100%', padding: '10px 8px',
                                   background: 'rgba(139,92,246,0.15)', border: '1px solid rgba(139,92,246,0.4)',
@@ -932,7 +792,7 @@ function CardForm({ onDone, onBack, initialData }) {
                                   fontSize: '0.85rem', fontWeight: '600',
                                 }}>⚡ Primal</button>
                               </a>
-                              <a href={nip46Uri} style={{ flex: 1, textDecoration: 'none' }}>
+                              <a href={nip46.uri} style={{ flex: 1, textDecoration: 'none' }}>
                                 <button style={{
                                   width: '100%', padding: '10px 8px',
                                   background: 'rgba(247,147,26,0.08)', border: '1px solid rgba(247,147,26,0.3)',
@@ -952,7 +812,7 @@ function CardForm({ onDone, onBack, initialData }) {
                               </span>
                             </div>
                             <button
-                              onClick={stopNip46}
+                              onClick={nip46.reset}
                               style={{
                                 width: '100%', marginTop: '10px', padding: '8px',
                                 background: 'transparent', border: '1px solid rgba(255,255,255,0.1)',
