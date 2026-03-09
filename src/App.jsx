@@ -597,7 +597,7 @@ function CardForm({ onDone, onBack, initialData }) {
   function handleSubmit() {
     if (form.nwcUrl) localStorage.setItem('nwcUrl', form.nwcUrl);
     else localStorage.removeItem('nwcUrl');
-    onDone({ ...form, avatarUrl, bannerUrl });
+    onDone({ ...form, avatarUrl, bannerUrl, npub: nostrNpub || undefined });
   }
 
   const inputStyle = (err) => ({
