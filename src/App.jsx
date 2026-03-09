@@ -72,6 +72,33 @@ async function fetchOwnNostrProfile() {
   };
 }
 
+async function fetchProfileByKey(input) {
+  const { nip19, getPublicKey } = await import('nostr-tools');
+  const trimmed = input.trim();
+  let npub;
+  if (trimmed.startsWith('nsec1')) {
+    const decoded = nip19.decode(trimmed);
+    if (decoded.type !== 'nsec') throw new Error('nsec inválido.');
+    const pubkeyHex = getPublicKey(decoded.data);
+    npub = nip19.npubEncode(pubkeyHex);
+  } else if (trimmed.startsWith('npub1')) {
+    npub = trimmed;
+  } else {
+    throw new Error('Ingresá un npub o nsec válido (empieza con npub1 o nsec1).');
+  }
+  const profile = await fetchFromNostr(npub);
+  if (!profile) throw new Error('No se encontró perfil Nostr para esa clave.');
+  return { ...profile, readonly: false };
+}
+
+async function fetchProfileByAmberCallback(hexPubkey) {
+  const { nip19 } = await import('nostr-tools');
+  const npub = nip19.npubEncode(hexPubkey);
+  const profile = await fetchFromNostr(npub);
+  if (!profile) throw new Error('No se encontró perfil Nostr.');
+  return { ...profile, readonly: false };
+}
+
 // ── Bitcoin price ticker ───────────────────────────────────────────────────────
 
 function BTCPrice() {
@@ -462,6 +489,25 @@ function CardForm({ onDone, onBack, initialData }) {
   const [bannerUrl, setBannerUrl] = useState(initialData?.bannerUrl || '');
   const [nostrImporting, setNostrImporting] = useState(false);
   const [nostrImportError, setNostrImportError] = useState('');
+  const [nostrModal, setNostrModal] = useState(false);
+  const [keyInput, setKeyInput] = useState('');
+  const [keyInputError, setKeyInputError] = useState('');
+  const [keyInputLoading, setKeyInputLoading] = useState(false);
+
+  // Detectar callback de Amber al volver a la página
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const amberPubkey = params.get('amber_pk');
+    if (!amberPubkey) return;
+    // Limpiar la URL
+    const cleanUrl = window.location.pathname;
+    window.history.replaceState({}, '', cleanUrl);
+    setNostrImporting(true);
+    fetchProfileByAmberCallback(amberPubkey)
+      .then(profile => applyNostrProfile(profile))
+      .catch(err => setNostrImportError(err.message))
+      .finally(() => setNostrImporting(false));
+  }, []);
 
   const [form, setForm] = useState({
     name: initialData?.name || '',
@@ -477,29 +523,57 @@ function CardForm({ onDone, onBack, initialData }) {
   const [errors, setErrors] = useState({});
   const [step, setStep] = useState(1); // 1: identity, 2: links
 
+  function applyNostrProfile(profile) {
+    setAvatarUrl(profile.avatarUrl);
+    setBannerUrl(profile.bannerUrl);
+    setForm(prev => ({
+      ...prev,
+      name: profile.name || prev.name,
+      bio: profile.bio || prev.bio,
+      lnAddress: profile.lnAddress || prev.lnAddress,
+      nip05: profile.nip05 || prev.nip05,
+      github: profile.github || prev.github,
+      twitter: profile.twitter || prev.twitter,
+      nostr: profile.nostr || prev.nostr,
+      extraLinks: profile.extraLinks.length ? profile.extraLinks : prev.extraLinks,
+    }));
+  }
+
   async function handleNostrImport() {
     setNostrImporting(true);
     setNostrImportError('');
+    setNostrModal(false);
     try {
       const profile = await fetchOwnNostrProfile();
-      setAvatarUrl(profile.avatarUrl);
-      setBannerUrl(profile.bannerUrl);
-      setForm(prev => ({
-        ...prev,
-        name: profile.name || prev.name,
-        bio: profile.bio || prev.bio,
-        lnAddress: profile.lnAddress || prev.lnAddress,
-        nip05: profile.nip05 || prev.nip05,
-        github: profile.github || prev.github,
-        twitter: profile.twitter || prev.twitter,
-        nostr: profile.nostr || prev.nostr,
-        extraLinks: profile.extraLinks.length ? profile.extraLinks : prev.extraLinks,
-      }));
+      applyNostrProfile(profile);
     } catch (err) {
       setNostrImportError(err.message);
     } finally {
       setNostrImporting(false);
     }
+  }
+
+  async function handleKeyImport() {
+    setKeyInputError('');
+    setKeyInputLoading(true);
+    try {
+      const profile = await fetchProfileByKey(keyInput);
+      applyNostrProfile(profile);
+      setNostrModal(false);
+      setKeyInput('');
+    } catch (err) {
+      setKeyInputError(err.message);
+    } finally {
+      setKeyInputLoading(false);
+    }
+  }
+
+  function handleAmberLogin() {
+    const callbackUrl = `${window.location.origin}${window.location.pathname}?amber_pk=`;
+    const amberUri = `nostrsigner:get_public_key?appName=DigitalCard&callbackUrl=${encodeURIComponent(callbackUrl)}`;
+    // Guardar que veníamos del form para restaurar al volver
+    sessionStorage.setItem('amber_pending', '1');
+    window.location.href = amberUri;
   }
 
   function handleAvatarChange(e) {
@@ -635,7 +709,7 @@ function CardForm({ onDone, onBack, initialData }) {
               {/* Nostr import */}
               <div style={{ marginBottom: '24px' }}>
                 <button
-                  onClick={handleNostrImport}
+                  onClick={() => { setNostrModal(true); setNostrImportError(''); setKeyInputError(''); }}
                   disabled={nostrImporting}
                   style={{
                     width: '100%', padding: '13px 16px',
@@ -664,6 +738,135 @@ function CardForm({ onDone, onBack, initialData }) {
                   </span>
                 )}
               </div>
+
+              {/* Modal de login Nostr */}
+              {nostrModal && (
+                <div
+                  onClick={() => setNostrModal(false)}
+                  style={{
+                    position: 'fixed', inset: 0, zIndex: 1000,
+                    background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)',
+                    display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+                    padding: '0 0 0 0',
+                  }}
+                >
+                  <div
+                    onClick={e => e.stopPropagation()}
+                    style={{
+                      width: '100%', maxWidth: '480px',
+                      background: '#111827',
+                      border: '1px solid rgba(255,255,255,0.1)',
+                      borderRadius: '24px 24px 0 0',
+                      padding: '28px 24px 36px',
+                      boxShadow: '0 -8px 40px rgba(0,0,0,0.5)',
+                    }}
+                  >
+                    {/* Handle bar */}
+                    <div style={{ width: '36px', height: '4px', background: 'rgba(255,255,255,0.15)', borderRadius: '2px', margin: '0 auto 24px' }} />
+
+                    <h3 style={{ margin: '0 0 6px', fontSize: '1.2rem', fontWeight: '700', textAlign: 'center' }}>
+                      <NostrIcon size={16} style={{ marginRight: '8px', verticalAlign: 'middle' }} />
+                      Conectar con Nostr
+                    </h3>
+                    <p style={{ margin: '0 0 24px', color: 'rgba(255,255,255,0.35)', fontSize: '0.82rem', textAlign: 'center' }}>
+                      Elegí cómo importar tu perfil
+                    </p>
+
+                    {/* Opción 1: Extensión */}
+                    <button
+                      onClick={handleNostrImport}
+                      style={{
+                        width: '100%', padding: '14px 16px', marginBottom: '10px',
+                        background: 'rgba(102,36,130,0.15)', border: '1px solid rgba(102,36,130,0.35)',
+                        borderRadius: '14px', color: '#c084fc', cursor: 'pointer',
+                        fontSize: '0.95rem', fontWeight: '600',
+                        display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
+                      }}
+                    >
+                      <span style={{ fontSize: '1.4rem' }}>🧩</span>
+                      <div>
+                        <div>Extensión del navegador</div>
+                        <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(192,132,252,0.6)', marginTop: '2px' }}>
+                          Alby, nos2x, Blockcore — solo desktop
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Opción 2: Amber */}
+                    <button
+                      onClick={handleAmberLogin}
+                      style={{
+                        width: '100%', padding: '14px 16px', marginBottom: '10px',
+                        background: 'rgba(247,147,26,0.08)', border: '1px solid rgba(247,147,26,0.3)',
+                        borderRadius: '14px', color: '#f7931a', cursor: 'pointer',
+                        fontSize: '0.95rem', fontWeight: '600',
+                        display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
+                      }}
+                    >
+                      <span style={{ fontSize: '1.4rem' }}>🔑</span>
+                      <div>
+                        <div>Amber</div>
+                        <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(247,147,26,0.6)', marginTop: '2px' }}>
+                          Signer nativo para Android — abre la app y volvé
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Opción 3: nsec/npub manual */}
+                    <div style={{
+                      padding: '14px 16px', marginBottom: '4px',
+                      background: 'rgba(0,255,157,0.05)', border: '1px solid rgba(0,255,157,0.2)',
+                      borderRadius: '14px',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+                        <span style={{ fontSize: '1.4rem' }}>🔐</span>
+                        <div>
+                          <div style={{ color: '#00ff9d', fontWeight: '600', fontSize: '0.95rem' }}>Ingresar clave (nsec / npub)</div>
+                          <div style={{ fontSize: '0.75rem', color: 'rgba(0,255,157,0.5)', marginTop: '2px' }}>
+                            Pegá tu clave privada o pública — estilo Primal
+                          </div>
+                        </div>
+                      </div>
+                      <input
+                        type="password"
+                        placeholder="nsec1... o npub1..."
+                        value={keyInput}
+                        onChange={e => { setKeyInput(e.target.value); setKeyInputError(''); }}
+                        onKeyDown={e => e.key === 'Enter' && keyInput && handleKeyImport()}
+                        style={{
+                          width: '100%', padding: '10px 14px',
+                          background: 'rgba(0,0,0,0.3)', border: `1px solid ${keyInputError ? '#ff6b6b' : 'rgba(0,255,157,0.2)'}`,
+                          borderRadius: '10px', color: '#fff', fontSize: '0.9rem',
+                          outline: 'none', boxSizing: 'border-box',
+                          fontFamily: 'monospace',
+                        }}
+                      />
+                      {keyInputError && (
+                        <span style={{ fontSize: '0.75rem', color: '#ff6b6b', marginTop: '6px', display: 'block' }}>
+                          {keyInputError}
+                        </span>
+                      )}
+                      <button
+                        onClick={handleKeyImport}
+                        disabled={!keyInput || keyInputLoading}
+                        style={{
+                          width: '100%', marginTop: '10px', padding: '10px',
+                          background: keyInput && !keyInputLoading ? 'rgba(0,255,157,0.15)' : 'rgba(255,255,255,0.05)',
+                          border: '1px solid rgba(0,255,157,0.3)',
+                          borderRadius: '10px', color: keyInput ? '#00ff9d' : 'rgba(255,255,255,0.3)',
+                          cursor: keyInput && !keyInputLoading ? 'pointer' : 'default',
+                          fontWeight: '600', fontSize: '0.9rem',
+                        }}
+                      >
+                        {keyInputLoading ? 'Importando...' : 'Importar perfil'}
+                      </button>
+                      <p style={{ margin: '8px 0 0', fontSize: '0.72rem', color: 'rgba(255,255,255,0.2)', textAlign: 'center' }}>
+                        Tu clave nunca se envía a ningún servidor
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '24px', opacity: 0.3 }}>
                 <div style={{ flex: 1, height: '1px', background: 'rgba(255,255,255,0.15)' }} />
