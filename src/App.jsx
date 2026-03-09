@@ -72,31 +72,105 @@ async function fetchOwnNostrProfile() {
   };
 }
 
-async function fetchProfileByKey(input) {
-  const { nip19, getPublicKey } = await import('nostr-tools');
-  const trimmed = input.trim();
-  let npub;
-  if (trimmed.startsWith('nsec1')) {
-    const decoded = nip19.decode(trimmed);
-    if (decoded.type !== 'nsec') throw new Error('nsec inválido.');
-    const pubkeyHex = getPublicKey(decoded.data);
-    npub = nip19.npubEncode(pubkeyHex);
-  } else if (trimmed.startsWith('npub1')) {
-    npub = trimmed;
-  } else {
-    throw new Error('Ingresá un npub o nsec válido (empieza con npub1 o nsec1).');
-  }
-  const profile = await fetchFromNostr(npub);
-  if (!profile) throw new Error('No se encontró perfil Nostr para esa clave.');
-  return { ...profile, readonly: false };
-}
-
-async function fetchProfileByAmberCallback(hexPubkey) {
+async function fetchProfileByHexPubkey(hexPubkey) {
   const { nip19 } = await import('nostr-tools');
   const npub = nip19.npubEncode(hexPubkey);
   const profile = await fetchFromNostr(npub);
   if (!profile) throw new Error('No se encontró perfil Nostr.');
   return { ...profile, readonly: false };
+}
+
+// ── Primal / NIP-46 connect ────────────────────────────────────────────────────
+
+async function initPrimalConnect() {
+  const { generateSecretKey, getPublicKey, bytesToHex } = await import('nostr-tools/pure');
+  const clientSecret = generateSecretKey();
+  const clientPubkey = getPublicKey(clientSecret);
+  const secret = 'sec-' + bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
+
+  localStorage.setItem('nip46_pending', JSON.stringify({
+    localSecretKey: bytesToHex(clientSecret),
+    localPublicKey: clientPubkey,
+    secret,
+    timestamp: Date.now(),
+  }));
+
+  const callbackUrl = `${window.location.origin}${window.location.pathname}?nip46_callback=1`;
+  const params = new URLSearchParams([
+    ['relay', 'wss://relay.primal.net'],
+    ['secret', secret],
+    ['name', 'Digital Card'],
+    ['url', window.location.origin],
+    ['callback', callbackUrl],
+  ]);
+  window.location.href = `nostrconnect://${clientPubkey}?${params}`;
+}
+
+async function completePrimalConnect(timeoutMs = 20000) {
+  const sessionStr = localStorage.getItem('nip46_pending');
+  if (!sessionStr) throw new Error('No hay sesión pendiente de Primal.');
+  const session = JSON.parse(sessionStr);
+  if (Date.now() - session.timestamp > 5 * 60 * 1000) {
+    localStorage.removeItem('nip46_pending');
+    throw new Error('La sesión expiró. Intentá de nuevo.');
+  }
+
+  const { hexToBytes, finalizeEvent } = await import('nostr-tools/pure');
+  const { nip44 } = await import('nostr-tools');
+  const localSecretKey = hexToBytes(session.localSecretKey);
+
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket('wss://relay.primal.net');
+    let done = false;
+
+    const fail = (msg) => { if (!done) { done = true; ws.close(); reject(new Error(msg)); } };
+    const timer = setTimeout(() => fail('Timeout: Primal no respondió. Abrí la app y aprobá la solicitud.'), timeoutMs);
+
+    ws.onopen = () => {
+      const since = Math.floor(Date.now() / 1000) - 300;
+      ws.send(JSON.stringify(['REQ', 'nip46', { kinds: [24133], '#p': [session.localPublicKey], since }]));
+    };
+
+    ws.onmessage = async (e) => {
+      if (done) return;
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg[0] !== 'EVENT') return;
+        const event = msg[2];
+        if (!event || event.kind !== 24133) return;
+
+        const signerPubkey = event.pubkey;
+        const convoKey = nip44.v2.utils.getConversationKey(localSecretKey, signerPubkey);
+        const parsed = JSON.parse(nip44.v2.decrypt(event.content, convoKey));
+
+        if (parsed.method === 'connect') {
+          const userPubkeyHex = parsed.params?.[0];
+          if (!userPubkeyHex) return;
+
+          // Send ACK back to signer
+          const ackContent = nip44.v2.encrypt(
+            JSON.stringify({ id: parsed.id, result: 'ack', error: '' }),
+            nip44.v2.utils.getConversationKey(localSecretKey, signerPubkey),
+          );
+          const ackEvent = finalizeEvent({
+            kind: 24133,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [['p', signerPubkey]],
+            content: ackContent,
+          }, localSecretKey);
+          ws.send(JSON.stringify(['EVENT', ackEvent]));
+
+          done = true;
+          clearTimeout(timer);
+          localStorage.removeItem('nip46_pending');
+          setTimeout(() => ws.close(), 500);
+          resolve(userPubkeyHex);
+        }
+      } catch { /* ignore decode errors */ }
+    };
+
+    ws.onerror = () => fail('Error conectando a relay.primal.net');
+  });
 }
 
 // ── Bitcoin price ticker ───────────────────────────────────────────────────────
@@ -494,19 +568,34 @@ function CardForm({ onDone, onBack, initialData }) {
   const [keyInputError, setKeyInputError] = useState('');
   const [keyInputLoading, setKeyInputLoading] = useState(false);
 
-  // Detectar callback de Amber al volver a la página
+  // Detectar callbacks de Amber y Primal al volver a la página
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const amberPubkey = params.get('amber_pk');
-    if (!amberPubkey) return;
-    // Limpiar la URL
     const cleanUrl = window.location.pathname;
-    window.history.replaceState({}, '', cleanUrl);
-    setNostrImporting(true);
-    fetchProfileByAmberCallback(amberPubkey)
-      .then(profile => applyNostrProfile(profile))
-      .catch(err => setNostrImportError(err.message))
-      .finally(() => setNostrImporting(false));
+
+    // Amber callback: ?event=<hex_pubkey>
+    const amberPubkey = params.get('event');
+    if (amberPubkey && amberPubkey.match(/^[0-9a-f]{64}$/i)) {
+      window.history.replaceState({}, '', cleanUrl);
+      setNostrImporting(true);
+      fetchProfileByHexPubkey(amberPubkey)
+        .then(profile => applyNostrProfile(profile))
+        .catch(err => setNostrImportError(err.message))
+        .finally(() => setNostrImporting(false));
+      return;
+    }
+
+    // Primal / NIP-46 callback: ?nip46_callback=1
+    const nip46Callback = params.get('nip46_callback');
+    if (nip46Callback && localStorage.getItem('nip46_pending')) {
+      window.history.replaceState({}, '', cleanUrl);
+      setNostrImporting(true);
+      completePrimalConnect()
+        .then(hexPubkey => fetchProfileByHexPubkey(hexPubkey))
+        .then(profile => applyNostrProfile(profile))
+        .catch(err => setNostrImportError(err.message))
+        .finally(() => setNostrImporting(false));
+    }
   }, []);
 
   const [form, setForm] = useState({
@@ -569,11 +658,18 @@ function CardForm({ onDone, onBack, initialData }) {
   }
 
   function handleAmberLogin() {
-    const callbackUrl = `${window.location.origin}${window.location.pathname}?amber_pk=`;
-    const amberUri = `nostrsigner:get_public_key?appName=DigitalCard&callbackUrl=${encodeURIComponent(callbackUrl)}`;
-    // Guardar que veníamos del form para restaurar al volver
-    sessionStorage.setItem('amber_pending', '1');
+    // NIP-55 compliant URI — Amber appends the hex pubkey directly at the end of callbackUrl
+    const callbackUrl = `${window.location.origin}${window.location.pathname}?event=`;
+    const amberUri = `nostrsigner:?compressionType=none&returnType=signature&type=get_public_key&callbackUrl=${encodeURIComponent(callbackUrl)}`;
     window.location.href = amberUri;
+  }
+
+  async function handlePrimalLogin() {
+    try {
+      await initPrimalConnect();
+    } catch (err) {
+      setNostrImportError(err.message);
+    }
   }
 
   function handleAvatarChange(e) {
@@ -803,67 +899,34 @@ function CardForm({ onDone, onBack, initialData }) {
                         display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
                       }}
                     >
-                      <span style={{ fontSize: '1.4rem' }}>🔑</span>
+                      <span style={{ fontSize: '1.4rem' }}>🟠</span>
                       <div>
                         <div>Amber</div>
                         <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(247,147,26,0.6)', marginTop: '2px' }}>
-                          Signer nativo para Android — abre la app y volvé
+                          Signer nativo para Android — abre Amber, aprobás y volvés
                         </div>
                       </div>
                     </button>
 
-                    {/* Opción 3: nsec/npub manual */}
-                    <div style={{
-                      padding: '14px 16px', marginBottom: '4px',
-                      background: 'rgba(0,255,157,0.05)', border: '1px solid rgba(0,255,157,0.2)',
-                      borderRadius: '14px',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
-                        <span style={{ fontSize: '1.4rem' }}>🔐</span>
-                        <div>
-                          <div style={{ color: '#00ff9d', fontWeight: '600', fontSize: '0.95rem' }}>Ingresar clave (nsec / npub)</div>
-                          <div style={{ fontSize: '0.75rem', color: 'rgba(0,255,157,0.5)', marginTop: '2px' }}>
-                            Pegá tu clave privada o pública — estilo Primal
-                          </div>
+                    {/* Opción 3: Primal */}
+                    <button
+                      onClick={handlePrimalLogin}
+                      style={{
+                        width: '100%', padding: '14px 16px', marginBottom: '4px',
+                        background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
+                        borderRadius: '14px', color: '#a78bfa', cursor: 'pointer',
+                        fontSize: '0.95rem', fontWeight: '600',
+                        display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
+                      }}
+                    >
+                      <span style={{ fontSize: '1.4rem' }}>⚡</span>
+                      <div>
+                        <div>Primal</div>
+                        <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(167,139,250,0.6)', marginTop: '2px' }}>
+                          iOS y Android — abre Primal, aprobás y volvés
                         </div>
                       </div>
-                      <input
-                        type="password"
-                        placeholder="nsec1... o npub1..."
-                        value={keyInput}
-                        onChange={e => { setKeyInput(e.target.value); setKeyInputError(''); }}
-                        onKeyDown={e => e.key === 'Enter' && keyInput && handleKeyImport()}
-                        style={{
-                          width: '100%', padding: '10px 14px',
-                          background: 'rgba(0,0,0,0.3)', border: `1px solid ${keyInputError ? '#ff6b6b' : 'rgba(0,255,157,0.2)'}`,
-                          borderRadius: '10px', color: '#fff', fontSize: '0.9rem',
-                          outline: 'none', boxSizing: 'border-box',
-                          fontFamily: 'monospace',
-                        }}
-                      />
-                      {keyInputError && (
-                        <span style={{ fontSize: '0.75rem', color: '#ff6b6b', marginTop: '6px', display: 'block' }}>
-                          {keyInputError}
-                        </span>
-                      )}
-                      <button
-                        onClick={handleKeyImport}
-                        disabled={!keyInput || keyInputLoading}
-                        style={{
-                          width: '100%', marginTop: '10px', padding: '10px',
-                          background: keyInput && !keyInputLoading ? 'rgba(0,255,157,0.15)' : 'rgba(255,255,255,0.05)',
-                          border: '1px solid rgba(0,255,157,0.3)',
-                          borderRadius: '10px', color: keyInput ? '#00ff9d' : 'rgba(255,255,255,0.3)',
-                          cursor: keyInput && !keyInputLoading ? 'pointer' : 'default',
-                          fontWeight: '600', fontSize: '0.9rem',
-                        }}
-                      >
-                        {keyInputLoading ? 'Importando...' : 'Importar perfil'}
-                      </button>
-                      <p style={{ margin: '8px 0 0', fontSize: '0.72rem', color: 'rgba(255,255,255,0.2)', textAlign: 'center' }}>
-                        Tu clave nunca se envía a ningún servidor
-                      </p>
-                    </div>
+                    </button>
                   </div>
                 </div>
               )}
