@@ -80,107 +80,22 @@ async function fetchProfileByHexPubkey(hexPubkey) {
   return { ...profile, readonly: false };
 }
 
-// ── Primal / NIP-46 connect ────────────────────────────────────────────────────
+// ── NIP-46 session generator (used from CardForm) ─────────────────────────────
 
-async function initPrimalConnect() {
+async function createNip46Session() {
   const { generateSecretKey, getPublicKey, bytesToHex } = await import('nostr-tools/pure');
-  const clientSecret = generateSecretKey();
-  const clientPubkey = getPublicKey(clientSecret);
-  const secret = 'sec-' + bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
-
-  localStorage.setItem('nip46_pending', JSON.stringify({
-    localSecretKey: bytesToHex(clientSecret),
-    localPublicKey: clientPubkey,
-    secret,
-    timestamp: Date.now(),
-  }));
-
-  const callbackUrl = `${window.location.origin}${window.location.pathname}?nip46_callback=1`;
-  const params = new URLSearchParams([
-    ['relay', 'wss://relay.primal.net'],
-    ['secret', secret],
-    ['name', 'Digital Card'],
-    ['url', window.location.origin],
-    ['callback', callbackUrl],
-  ]);
-  window.location.href = `nostrconnect://${clientPubkey}?${params}`;
-}
-
-async function completePrimalConnect(timeoutMs = 20000) {
-  const sessionStr = localStorage.getItem('nip46_pending');
-  if (!sessionStr) throw new Error('No hay sesión pendiente de Primal.');
-  const session = JSON.parse(sessionStr);
-  if (Date.now() - session.timestamp > 5 * 60 * 1000) {
-    localStorage.removeItem('nip46_pending');
-    throw new Error('La sesión expiró. Intentá de nuevo.');
-  }
-
-  const { hexToBytes, finalizeEvent } = await import('nostr-tools/pure');
-  const { nip44 } = await import('nostr-tools');
-  const { BunkerSigner } = await import('nostr-tools/nip46');
-  const localSecretKey = hexToBytes(session.localSecretKey);
-
-  // Step 1: wait for the signer's initial connect event to get the bunker pubkey
-  const signerPubkey = await new Promise((resolve, reject) => {
-    const ws = new WebSocket('wss://relay.primal.net');
-    let done = false;
-    const fail = (msg) => { if (!done) { done = true; ws.close(); reject(new Error(msg)); } };
-    const timer = setTimeout(() => fail('Timeout: Primal no respondió. Abrí la app y aprobá la solicitud.'), timeoutMs);
-
-    ws.onopen = () => {
-      const since = Math.floor(Date.now() / 1000) - 300;
-      ws.send(JSON.stringify(['REQ', 'nip46', { kinds: [24133], '#p': [session.localPublicKey], since }]));
-    };
-
-    ws.onmessage = async (e) => {
-      if (done) return;
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg[0] !== 'EVENT') return;
-        const event = msg[2];
-        if (!event || event.kind !== 24133) return;
-
-        const sigPubkey = event.pubkey;
-        const convoKey = nip44.v2.utils.getConversationKey(localSecretKey, sigPubkey);
-        const parsed = JSON.parse(nip44.v2.decrypt(event.content, convoKey));
-
-        // Format A: signer sends { method: "connect", params: [signerPubkey, secret] }
-        if (parsed.method === 'connect') {
-          const ack = nip44.v2.encrypt(
-            JSON.stringify({ id: parsed.id, result: 'ack', error: '' }),
-            convoKey,
-          );
-          ws.send(JSON.stringify(['EVENT', finalizeEvent({
-            kind: 24133, created_at: Math.floor(Date.now() / 1000),
-            tags: [['p', sigPubkey]], content: ack,
-          }, localSecretKey)]));
-          done = true; clearTimeout(timer); setTimeout(() => ws.close(), 400);
-          resolve(sigPubkey);
-          return;
-        }
-
-        // Format B: signer sends { result: secret } confirming our nostrconnect URI
-        const r = parsed.result;
-        if (r === session.secret || r === 'ack' || r === true || r === 'true') {
-          done = true; clearTimeout(timer); setTimeout(() => ws.close(), 400);
-          resolve(sigPubkey);
-        }
-      } catch { /* ignore decode errors */ }
-    };
-
-    ws.onerror = () => fail('Error conectando a relay.primal.net');
-  });
-
-  // Step 2: use BunkerSigner to get the user's actual public key
-  const signer = BunkerSigner.fromBunker(localSecretKey, {
-    pubkey: signerPubkey,
+  const { createNostrConnectURI } = await import('nostr-tools/nip46');
+  const localSecret = generateSecretKey();
+  const clientPubkey = getPublicKey(localSecret);
+  const randomSecret = bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
+  const uri = createNostrConnectURI({
+    clientPubkey,
     relays: ['wss://relay.primal.net'],
-  }, {});
-  const userPubkeyHex = await signer.getPublicKey();
-  signer.close?.();
-
-  localStorage.removeItem('nip46_pending');
-  return userPubkeyHex;
+    secret: randomSecret,
+    name: 'Digital Card',
+    url: window.location.origin,
+  });
+  return { localSecret, clientPubkey, randomSecret, uri };
 }
 
 // ── Bitcoin price ticker ───────────────────────────────────────────────────────
@@ -223,33 +138,8 @@ export default function App() {
   const [view, setView] = useState('landing');
   const [cardData, setCardData] = useState(null);
   const [ownCard, setOwnCard] = useState(null);
-  const [nostrPreset, setNostrPreset] = useState(null); // prefilled from Amber/Primal callback
-
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const cleanUrl = window.location.pathname;
-
-    // ── Amber callback: ?event=<hex_pubkey> (NIP-55) ──────────────────────────
-    const amberPk = params.get('event');
-    if (amberPk && /^[0-9a-f]{64}$/i.test(amberPk)) {
-      window.history.replaceState({}, '', cleanUrl);
-      setView('loading');
-      fetchProfileByHexPubkey(amberPk)
-        .then(profile => { setNostrPreset(profile); setView('form'); })
-        .catch(() => setView('form'));
-      return;
-    }
-
-    // ── Primal / NIP-46 callback: ?nip46_callback=1 ───────────────────────────
-    if (params.get('nip46_callback') && localStorage.getItem('nip46_pending')) {
-      window.history.replaceState({}, '', cleanUrl);
-      setView('loading');
-      completePrimalConnect()
-        .then(hexPubkey => fetchProfileByHexPubkey(hexPubkey))
-        .then(profile => { setNostrPreset(profile); setView('form'); })
-        .catch(() => setView('form'));
-      return;
-    }
 
     const npub = params.get('npub');
     const cardParam = params.get('card');
@@ -312,7 +202,7 @@ export default function App() {
     </div>
   );
   else if (view === 'landing') content = <Landing onStart={() => ownCard ? setView('card') : setView('form')} hasCard={!!ownCard} onSearch={openSearch} />;
-  else if (view === 'form') content = <CardForm onDone={saveCard} onBack={() => setView('landing')} initialData={nostrPreset || ownCard} />;
+  else if (view === 'form') content = <CardForm onDone={saveCard} onBack={() => setView('landing')} initialData={ownCard} />;
   else if (view === 'card') content = <CardView data={cardData} onEdit={cardData?.readonly ? null : () => setView('form')} onBack={cardData?.readonly ? () => { setCardData(ownCard); setView('search'); } : null} onSearch={openSearch} onHome={() => { if (ownCard) setCardData(ownCard); setView('landing'); }} />;
   else if (view === 'search') content = <SearchView onCardFound={handleCardFound} onBack={handleBackFromSearch} />;
 
@@ -599,6 +489,14 @@ function CardForm({ onDone, onBack, initialData }) {
   const [nostrImporting, setNostrImporting] = useState(false);
   const [nostrImportError, setNostrImportError] = useState('');
   const [nostrModal, setNostrModal] = useState(false);
+  // NIP-46 state (same-page, no navigation)
+  const [nip46Uri, setNip46Uri] = useState(null);
+  const [nip46Status, setNip46Status] = useState(null); // null | 'waiting' | 'connected'
+  const wsRef = useRef(null);
+  const nip46Ref = useRef(null); // { localSecret, clientPubkey, randomSecret }
+
+  // Cleanup WebSocket on unmount
+  useEffect(() => () => wsRef.current?.close(), []);
 
   const [form, setForm] = useState({
     name: initialData?.name || '',
@@ -644,19 +542,97 @@ function CardForm({ onDone, onBack, initialData }) {
     }
   }
 
-  function handleAmberLogin() {
-    // NIP-55 compliant URI — Amber appends the hex pubkey directly at the end of callbackUrl
-    const callbackUrl = `${window.location.origin}${window.location.pathname}?event=`;
-    const amberUri = `nostrsigner:?compressionType=none&returnType=signature&type=get_public_key&callbackUrl=${encodeURIComponent(callbackUrl)}`;
-    window.location.href = amberUri;
-  }
-
-  async function handlePrimalLogin() {
+  async function startNip46() {
+    wsRef.current?.close();
+    setNip46Status('waiting');
+    setNostrImportError('');
     try {
-      await initPrimalConnect();
+      const session = await createNip46Session();
+      nip46Ref.current = session;
+      setNip46Uri(session.uri);
+      listenForNip46(session);
     } catch (err) {
+      setNip46Status(null);
       setNostrImportError(err.message);
     }
+  }
+
+  async function listenForNip46(session) {
+    const { nip44 } = await import('nostr-tools');
+    const { finalizeEvent } = await import('nostr-tools/pure');
+    const { localSecret, clientPubkey, randomSecret } = session;
+
+    const ws = new WebSocket('wss://relay.primal.net');
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify(['REQ', 'nip46', {
+        kinds: [24133], '#p': [clientPubkey],
+        since: Math.floor(Date.now() / 1000) - 5,
+      }]));
+    };
+
+    ws.onmessage = async (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg[0] !== 'EVENT') return;
+        const event = msg[2];
+        if (!event || event.kind !== 24133) return;
+
+        const signerPubkey = event.pubkey;
+        const convoKey = nip44.v2.utils.getConversationKey(localSecret, signerPubkey);
+        const parsed = JSON.parse(nip44.v2.decrypt(event.content, convoKey));
+
+        const sendEvent = (content) => {
+          ws.send(JSON.stringify(['EVENT', finalizeEvent({
+            kind: 24133, created_at: Math.floor(Date.now() / 1000),
+            tags: [['p', signerPubkey]], content,
+          }, localSecret)]));
+        };
+
+        // The signer initiates connection: respond ACK then request pubkey
+        if (parsed.method === 'connect') {
+          sendEvent(nip44.v2.encrypt(
+            JSON.stringify({ id: parsed.id, result: 'ack', error: '' }), convoKey,
+          ));
+          const reqId = 'gpk' + Date.now();
+          sendEvent(nip44.v2.encrypt(
+            JSON.stringify({ id: reqId, method: 'get_public_key', params: [] }), convoKey,
+          ));
+          return;
+        }
+
+        // Alt format: signer confirms with result = secret, then request pubkey
+        const r = parsed.result;
+        if ((r === randomSecret || r === 'ack') && !parsed.id?.startsWith('gpk')) {
+          const reqId = 'gpk' + Date.now();
+          sendEvent(nip44.v2.encrypt(
+            JSON.stringify({ id: reqId, method: 'get_public_key', params: [] }), convoKey,
+          ));
+          return;
+        }
+
+        // get_public_key response: hex pubkey in result
+        if (parsed.id?.startsWith('gpk') && typeof parsed.result === 'string' && /^[0-9a-f]{64}$/i.test(parsed.result)) {
+          ws.close();
+          setNip46Status('connected');
+          fetchProfileByHexPubkey(parsed.result)
+            .then(profile => {
+              applyNostrProfile(profile);
+              setTimeout(() => { setNostrModal(false); setNip46Uri(null); setNip46Status(null); }, 800);
+            })
+            .catch(err => setNostrImportError(err.message));
+        }
+      } catch { /* ignore decode errors */ }
+    };
+
+    ws.onerror = () => { setNip46Status(null); setNostrImportError('Error conectando al relay. Intentá de nuevo.'); };
+  }
+
+  function stopNip46() {
+    wsRef.current?.close();
+    setNip46Uri(null);
+    setNip46Status(null);
   }
 
   function handleAvatarChange(e) {
@@ -875,45 +851,86 @@ function CardForm({ onDone, onBack, initialData }) {
                       </div>
                     </button>
 
-                    {/* Opción 2: Amber */}
-                    <button
-                      onClick={handleAmberLogin}
-                      style={{
-                        width: '100%', padding: '14px 16px', marginBottom: '10px',
-                        background: 'rgba(247,147,26,0.08)', border: '1px solid rgba(247,147,26,0.3)',
-                        borderRadius: '14px', color: '#f7931a', cursor: 'pointer',
-                        fontSize: '0.95rem', fontWeight: '600',
-                        display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
-                      }}
-                    >
-                      <span style={{ fontSize: '1.4rem' }}>🟠</span>
-                      <div>
-                        <div>Amber</div>
-                        <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(247,147,26,0.6)', marginTop: '2px' }}>
-                          Signer nativo para Android — abre Amber, aprobás y volvés
+                    {/* Opción 2: NIP-46 mobile (Primal + Amber) */}
+                    {!nip46Uri ? (
+                      <button
+                        onClick={startNip46}
+                        style={{
+                          width: '100%', padding: '14px 16px', marginBottom: '4px',
+                          background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
+                          borderRadius: '14px', color: '#a78bfa', cursor: 'pointer',
+                          fontSize: '0.95rem', fontWeight: '600',
+                          display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
+                        }}
+                      >
+                        <span style={{ fontSize: '1.4rem' }}>📱</span>
+                        <div>
+                          <div>Primal / Amber (móvil)</div>
+                          <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(167,139,250,0.6)', marginTop: '2px' }}>
+                            Genera un QR — escaneá con tu app Nostr
+                          </div>
                         </div>
-                      </div>
-                    </button>
-
-                    {/* Opción 3: Primal */}
-                    <button
-                      onClick={handlePrimalLogin}
-                      style={{
-                        width: '100%', padding: '14px 16px', marginBottom: '4px',
+                      </button>
+                    ) : (
+                      <div style={{
+                        padding: '16px', marginBottom: '4px',
                         background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.3)',
-                        borderRadius: '14px', color: '#a78bfa', cursor: 'pointer',
-                        fontSize: '0.95rem', fontWeight: '600',
-                        display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left',
-                      }}
-                    >
-                      <span style={{ fontSize: '1.4rem' }}>⚡</span>
-                      <div>
-                        <div>Primal</div>
-                        <div style={{ fontSize: '0.75rem', fontWeight: '400', color: 'rgba(167,139,250,0.6)', marginTop: '2px' }}>
-                          iOS y Android — abre Primal, aprobás y volvés
-                        </div>
+                        borderRadius: '14px',
+                      }}>
+                        {nip46Status === 'connected' ? (
+                          <div style={{ textAlign: 'center', padding: '8px', color: '#4ade80', fontWeight: '600' }}>
+                            ✅ Conectado — importando perfil...
+                          </div>
+                        ) : (
+                          <>
+                            {/* QR code */}
+                            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '12px', background: '#fff', borderRadius: '12px', padding: '12px' }}>
+                              <QRCodeSVG value={nip46Uri} size={180} level="M" />
+                            </div>
+                            <p style={{ margin: '0 0 10px', fontSize: '0.75rem', color: 'rgba(167,139,250,0.7)', textAlign: 'center' }}>
+                              Escaneá con Primal, Amber u otra app Nostr
+                            </p>
+                            {/* Direct open buttons */}
+                            <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                              <a href={nip46Uri} style={{ flex: 1, textDecoration: 'none' }}>
+                                <button style={{
+                                  width: '100%', padding: '10px 8px',
+                                  background: 'rgba(139,92,246,0.15)', border: '1px solid rgba(139,92,246,0.4)',
+                                  borderRadius: '10px', color: '#a78bfa', cursor: 'pointer',
+                                  fontSize: '0.85rem', fontWeight: '600',
+                                }}>⚡ Primal</button>
+                              </a>
+                              <a href={nip46Uri} style={{ flex: 1, textDecoration: 'none' }}>
+                                <button style={{
+                                  width: '100%', padding: '10px 8px',
+                                  background: 'rgba(247,147,26,0.08)', border: '1px solid rgba(247,147,26,0.3)',
+                                  borderRadius: '10px', color: '#f7931a', cursor: 'pointer',
+                                  fontSize: '0.85rem', fontWeight: '600',
+                                }}>🟠 Amber</button>
+                              </a>
+                            </div>
+                            {/* Waiting indicator */}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px', background: 'rgba(255,255,255,0.04)', borderRadius: '8px' }}>
+                              <div style={{
+                                width: '8px', height: '8px', borderRadius: '50%',
+                                background: '#a78bfa', animation: 'pulse 1.5s infinite',
+                              }} />
+                              <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.4)' }}>
+                                Esperando aprobación en la app...
+                              </span>
+                            </div>
+                            <button
+                              onClick={stopNip46}
+                              style={{
+                                width: '100%', marginTop: '10px', padding: '8px',
+                                background: 'transparent', border: '1px solid rgba(255,255,255,0.1)',
+                                borderRadius: '8px', color: 'rgba(255,255,255,0.3)', cursor: 'pointer', fontSize: '0.8rem',
+                              }}
+                            >Cancelar</button>
+                          </>
+                        )}
                       </div>
-                    </button>
+                    )}
                   </div>
                 </div>
               )}
