@@ -1391,6 +1391,7 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
       const inv = await ln.requestInvoice({ satoshi: satsAmount });
       setInvoice(inv.paymentRequest);
       setVerifyUrl(inv.verify || null);
+      setAwaitingMobileConfirm(true);
       setStatus({ msg: '', type: '' });
 
       // Polling automático: detectar pago por QR
