@@ -1392,6 +1392,22 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
       setInvoice(inv.paymentRequest);
       setVerifyUrl(inv.verify || null);
       setStatus({ msg: '', type: '' });
+
+      // Polling automático: detectar pago por QR
+      if (inv.verify) {
+        clearTimeout(pollRef.current);
+        const startTime = Date.now();
+        const pollQR = async () => {
+          if (Date.now() - startTime > 600000) return; // 10 min máximo
+          try {
+            const res = await fetch(inv.verify);
+            const vdata = await res.json();
+            if (vdata.settled) { paymentSuccess(); return; }
+          } catch {}
+          pollRef.current = setTimeout(pollQR, 3000);
+        };
+        pollRef.current = setTimeout(pollQR, 3000);
+      }
     } catch (err) {
       setStatus({ msg: 'Error: ' + err.message, type: 'error' });
     } finally {
