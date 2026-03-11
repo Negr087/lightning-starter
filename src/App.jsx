@@ -1942,6 +1942,11 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
                 </button>
               </div>
 
+              {/* QR */}
+              <div style={{ display: 'flex', justifyContent: 'center', background: '#fff', borderRadius: '16px', padding: '16px' }}>
+                <QRCodeSVG value={url} size={180} level="M" />
+              </div>
+
               {/* Social share buttons */}
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
                 {[
