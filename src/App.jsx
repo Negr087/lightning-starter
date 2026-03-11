@@ -146,7 +146,12 @@ export default function App() {
     if (npub) {
       setView('loading');
       fetchFromNostr(npub)
-        .then(data => { if (data) { setCardData(data); setView('card'); } else setView('landing'); })
+        .then(async nostrData => {
+          if (!nostrData) { setView('landing'); return; }
+          const saved = await loadCardRemote(npub).catch(() => null);
+          setCardData(saved ? { ...nostrData, ...saved, readonly: true } : nostrData);
+          setView('card');
+        })
         .catch(() => setView('landing'));
       return;
     }
@@ -156,7 +161,12 @@ export default function App() {
       // npub
       if (decoded.startsWith('npub1')) {
         fetchFromNostr(decoded)
-          .then(data => { if (data) { setCardData(data); setView('card'); } else setView('landing'); })
+          .then(async nostrData => {
+            if (!nostrData) { setView('landing'); return; }
+            const saved = await loadCardRemote(decoded).catch(() => null);
+            setCardData(saved ? { ...nostrData, ...saved, readonly: true } : nostrData);
+            setView('card');
+          })
           .catch(() => setView('landing'));
         return;
       }
@@ -168,8 +178,9 @@ export default function App() {
             const nip05Hex = await resolveNip05(decoded).catch(() => null);
             if (nip05Hex) {
               const card = await fetchProfileByHexPubkey(nip05Hex);
-              card.readonly = true;
-              setCardData(card); setView('card'); return;
+              const saved = await loadCardRemote(card.npub).catch(() => null);
+              setCardData(saved ? { ...card, ...saved, readonly: true } : { ...card, readonly: true });
+              setView('card'); return;
             }
             // Supabase
             const remote = await loadCardRemote(decoded.toLowerCase());
