@@ -13,9 +13,9 @@ const headers = {
  * Retorna null si no hay ninguna.
  */
 export function getStorageKey(cardData) {
-  if (cardData?.lightningAddress) return cardData.lightningAddress.toLowerCase();
-  if (cardData?.lnAddress) return cardData.lnAddress.toLowerCase();
   if (cardData?.npub) return cardData.npub;
+  if (cardData?.lnAddress) return cardData.lnAddress.toLowerCase();
+  if (cardData?.lightningAddress) return cardData.lightningAddress.toLowerCase();
   return null;
 }
 
