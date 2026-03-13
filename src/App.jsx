@@ -5,6 +5,7 @@ import { LightningAddress } from '@getalby/lightning-tools';
 import { nwc } from '@getalby/sdk';
 import NDK from '@nostr-dev-kit/ndk';
 import { saveCardRemote, loadCardRemote, getStorageKey } from './storage';
+import { NWCWalletManager, WalletTransfer, getDefaultNWCWallet, getNWCWallets } from './NWCWallets';
 
 // ── Nostr + NWC ───────────────────────────────────────────────────────────────
 
@@ -614,7 +615,6 @@ function CardForm({ onDone, onBack, initialData }) {
     nostr: initialData?.nostr || 'https://primal.net/',
     twitter: initialData?.twitter || 'https://x.com/',
     extraLinks: initialData?.extraLinks || [],
-    nwcUrl: localStorage.getItem('nwcUrl') || '',
   });
   const [errors, setErrors] = useState({});
   const [step, setStep] = useState(1); // 1: identity, 2: links
@@ -724,8 +724,6 @@ function CardForm({ onDone, onBack, initialData }) {
   }
 
   function handleSubmit() {
-    if (form.nwcUrl) localStorage.setItem('nwcUrl', form.nwcUrl);
-    else localStorage.removeItem('nwcUrl');
     onDone({ ...form, avatarUrl, bannerUrl, npub: nostrNpub || undefined });
   }
 
@@ -1152,20 +1150,7 @@ function CardForm({ onDone, onBack, initialData }) {
               </button>
 
               {/* NWC */}
-              <div style={{ marginTop: '8px', marginBottom: '8px', padding: '16px', background: 'rgba(247,147,26,0.05)', border: '1px solid rgba(247,147,26,0.15)', borderRadius: '12px' }}>
-                <label style={{ ...labelStyle, color: '#f7931a' }}>⚡ NWC — Nostr Wallet Connect <span style={{ color: 'rgba(255,255,255,0.25)', textTransform: 'none', fontWeight: 400 }}>(opcional)</span></label>
-                <input
-                  style={{ ...inputStyle(false), borderColor: form.nwcUrl ? 'rgba(247,147,26,0.4)' : 'rgba(255,255,255,0.12)' }}
-                  placeholder="nostr+walletconnect://..."
-                  value={form.nwcUrl}
-                  onChange={e => set('nwcUrl', e.target.value)}
-                  onFocus={e => e.target.style.borderColor = '#f7931a'}
-                  onBlur={e => e.target.style.borderColor = form.nwcUrl ? 'rgba(247,147,26,0.4)' : 'rgba(255,255,255,0.12)'}
-                />
-                <span style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.3)', marginTop: '6px', display: 'block' }}>
-                  Conectá tu wallet para generar invoices. Se guarda solo en tu browser, nunca se publica.
-                </span>
-              </div>
+              <NWCWalletManager />
 
               <div style={{ marginTop: '32px', display: 'flex', gap: '12px' }}>
                 <button
@@ -1574,11 +1559,11 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
 
   async function payWithNWC() {
     if (!invoice) return;
-    const nwcUrl = localStorage.getItem('nwcUrl');
-    if (!nwcUrl) { setStatus({ msg: 'No tenés NWC configurado. Editá tu tarjeta para agregarlo.', type: 'error' }); return; }
+    const wallet = getDefaultNWCWallet();
+    if (!wallet) { setStatus({ msg: 'No tenés NWC configurado. Editá tu tarjeta para agregarlo.', type: 'error' }); return; }
     try {
-      setStatus({ msg: 'Pagando con NWC...', type: 'info' });
-      const client = new nwc.NWCClient({ nostrWalletConnectUrl: nwcUrl });
+      setStatus({ msg: `Pagando con ${wallet.name}...`, type: 'info' });
+      const client = new nwc.NWCClient({ nostrWalletConnectUrl: wallet.url });
       await client.payInvoice({ invoice });
       paymentSuccess();
     } catch (err) {
@@ -1836,7 +1821,7 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
                 <button style={{ width: '100%', padding: '14px', background: '#f7931a', color: '#000', fontWeight: '700', border: 'none', borderRadius: '12px', cursor: 'pointer', fontSize: '0.95rem' }} onClick={payWithWebLN}>
                   Pagar con wallet (WebLN)
                 </button>
-                {localStorage.getItem('nwcUrl') && (
+                {getDefaultNWCWallet() && (
                   <button style={{ width: '100%', padding: '14px', background: 'rgba(247,147,26,0.12)', border: '1px solid rgba(247,147,26,0.4)', color: '#f7931a', fontWeight: '700', borderRadius: '12px', cursor: 'pointer', fontSize: '0.95rem' }} onClick={payWithNWC}>
                     Pagar con NWC
                   </button>
@@ -1872,6 +1857,9 @@ function CardView({ data, onEdit, onBack, onSearch, onHome }) {
             </button>
           </div>
         )}
+
+        {/* Transferencia entre wallets propias */}
+        {!data.readonly && <WalletTransfer />}
 
         {/* Share button */}
         <button
